@@ -1,0 +1,184 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // On create: protected fields must be at default values.
+    function defaultProfileFields() {
+      return request.resource.data.rating == 0
+          && request.resource.data.ratingCount == 0
+          && request.resource.data.trustBadges.size() == 0
+          && request.resource.data.activeMatchId == null;
+    }
+
+    // On update: client cannot change protected fields. Cloud Functions will
+    // (Phase 5) be the only writer of these.
+    function protectedUnchanged() {
+      return request.resource.data.rating == resource.data.rating
+          && request.resource.data.ratingCount == resource.data.ratingCount
+          && request.resource.data.trustBadges == resource.data.trustBadges
+          && request.resource.data.activeMatchId == resource.data.activeMatchId
+          && request.resource.data.email == resource.data.email
+          && request.resource.data.createdAt == resource.data.createdAt;
+    }
+
+    match /users/{userId} {
+      allow read: if request.auth != null;
+
+      allow create: if request.auth != null
+        && request.auth.uid == userId
+        && defaultProfileFields();
+
+      allow update: if request.auth != null
+        && request.auth.uid == userId
+        && protectedUnchanged();
+
+      allow delete: if false;
+    }
+
+    // Phase 2: swipes. Doc id is `${swiperUid}_${swipedUid}` for round 1,
+    // and `${swiperUid}_${swipedUid}_r${N}` for repeat swaps (Phase 6 polish).
+    // Each user can swipe the same person once per round.
+    match /swipes/{swipeId} {
+      allow read: if request.auth != null
+        && (resource == null
+            || request.auth.uid == resource.data.swiperUid
+            || request.auth.uid == resource.data.swipedUid);
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.swiperUid
+        && request.resource.data.swiperUid != request.resource.data.swipedUid
+        && swipeId.matches(
+            '^' + request.resource.data.swiperUid + '_'
+                + request.resource.data.swipedUid
+                + '(_r[1-9][0-9]*)?$')
+        && (request.resource.data.direction == 'like'
+            || request.resource.data.direction == 'pass');
+
+      allow update, delete: if false;
+    }
+
+    // Phase 2/3: matches. Doc id is the sorted UID pair so both clients land
+    // on the same id and can't create duplicate match docs. Client creates
+    // the match when both swipes are 'like'. Phase 5 will tighten with a
+    // Cloud Function.
+    //
+    // State machine (Phase 3):
+    //   matched (turnsCompleted=[])
+    //     → inProgress (one user marks turn done; turnsCompleted=[that uid])
+    //     → completed  (other user marks turn done; turnsCompleted has both)
+    // Each user may mark exactly once. State must match the size of
+    // turnsCompleted. Rules enforce all of this so a malicious client can't
+    // skip the lock.
+    match /matches/{matchId} {
+      allow read: if request.auth != null
+        && (resource == null || request.auth.uid in resource.data.userIds);
+
+      // Round 1 ids have no suffix; round N >= 2 ids end in `_r<N>`.
+      // Same convention as Match.idFor / Swipe.idFor on the client.
+      function roundSuffix(r) {
+        return r == 1 ? '' : '_r' + string(r);
+      }
+
+      // True when `from` has a stored 'like' swipe on `to` for round `r`.
+      function liked(from, to, r) {
+        let path = /databases/$(database)/documents/swipes/$(from + '_' + to + roundSuffix(r));
+        return exists(path) && get(path).data.direction == 'like';
+      }
+
+      // A match may only be created when BOTH users have liked each other in
+      // the same round, and the doc id must be the sorted uid pair (+ round
+      // suffix). userIds must be sorted, which also rules out [me, me].
+      allow create: if request.auth != null
+        && request.resource.data.userIds is list
+        && request.resource.data.userIds.size() == 2
+        && request.resource.data.userIds[0] < request.resource.data.userIds[1]
+        && request.auth.uid in request.resource.data.userIds
+        && request.resource.data.roundNumber is int
+        && request.resource.data.roundNumber >= 1
+        && matchId == request.resource.data.userIds[0] + '_'
+              + request.resource.data.userIds[1]
+              + roundSuffix(request.resource.data.roundNumber)
+        && liked(request.resource.data.userIds[0],
+                 request.resource.data.userIds[1],
+                 request.resource.data.roundNumber)
+        && liked(request.resource.data.userIds[1],
+                 request.resource.data.userIds[0],
+                 request.resource.data.roundNumber)
+        && request.resource.data.state == 'matched'
+        && request.resource.data.turnsCompleted is list
+        && request.resource.data.turnsCompleted.size() == 0;
+
+      allow update: if request.auth != null
+        && request.auth.uid in resource.data.userIds
+        && request.resource.data.userIds == resource.data.userIds
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.turnsCompleted is list
+        && request.resource.data.turnsCompleted.size() ==
+              resource.data.turnsCompleted.size() + 1
+        && request.resource.data.turnsCompleted.hasAll(
+              resource.data.turnsCompleted)
+        && request.auth.uid in request.resource.data.turnsCompleted
+        && !(request.auth.uid in resource.data.turnsCompleted)
+        && (
+          (request.resource.data.turnsCompleted.size() == 1
+            && request.resource.data.state == 'inProgress')
+          ||
+          (request.resource.data.turnsCompleted.size() == 2
+            && request.resource.data.state == 'completed')
+        );
+
+      allow delete: if false;
+
+      // Phase 4: chat messages live as a subcollection on the match.
+      // Only the two match members can read; only a member can send a
+      // message, and they must send as themselves. Messages are append-only.
+      match /messages/{messageId} {
+        function parentMatch() {
+          return get(/databases/$(database)/documents/matches/$(matchId)).data;
+        }
+
+        allow read: if request.auth != null
+          && request.auth.uid in parentMatch().userIds;
+
+        allow create: if request.auth != null
+          && request.auth.uid in parentMatch().userIds
+          && request.resource.data.senderUid == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 2000;
+
+        allow update, delete: if false;
+      }
+    }
+
+    // Phase 5A: ratings. Doc id is `${matchId}_${raterUid}` so each user can
+    // rate exactly once per match. Aggregate fields (rating, ratingCount,
+    // trustBadges) live on the user doc and are written by Cloud Functions
+    // only — see the user-doc rules above.
+    match /ratings/{ratingId} {
+      function parentMatch() {
+        return get(/databases/$(database)/documents/matches/$(
+          request.resource.data.matchId)).data;
+      }
+
+      allow read: if request.auth != null;
+
+      allow create: if request.auth != null
+        && request.resource.data.raterUid == request.auth.uid
+        && request.resource.data.raterUid != request.resource.data.ratedUid
+        && ratingId == request.resource.data.matchId + '_'
+              + request.resource.data.raterUid
+        && request.resource.data.stars is int
+        && request.resource.data.stars >= 1
+        && request.resource.data.stars <= 5
+        && request.resource.data.note is string
+        && request.resource.data.note.size() <= 500
+        && request.auth.uid in parentMatch().userIds
+        && request.resource.data.ratedUid in parentMatch().userIds
+        && parentMatch().state == 'completed';
+
+      allow update, delete: if false;
+    }
+  }
+}
