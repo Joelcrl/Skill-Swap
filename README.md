@@ -82,12 +82,9 @@ Deterministic IDs (sorted UID pairs, `matchId_raterUid`) prevent duplicate match
 - Only the two members of a swap can read or send its messages; messages cannot be edited or deleted.
 - Ratings require a completed swap you are part of, and you cannot rate yourself.
 
-
 The Firebase config in `lib/firebase_options.dart` and `android/app/google-services.json` is not a secret. It only identifies the Firebase project; what anyone can read or write is decided by `firestore.rules`.
 
 ## Getting started
-
-This repo is already connected to the Firebase project `skill-swap-ebe85`. If you have access to that project you can skip step 3.
 
 ### 1. Install the tools
 
@@ -103,7 +100,7 @@ cd <repo-folder>
 flutter pub get
 ```
 
-### 3. (Only for your own Firebase project) Connect Firebase
+### 3. Connect your own Firebase project
 
 1. In the [Firebase console](https://console.firebase.google.com), create a project and enable **Authentication → Email/Password** and **Cloud Firestore**.
 2. Point the app at it:
@@ -111,10 +108,9 @@ flutter pub get
    ```bash
    dart pub global activate flutterfire_cli
    flutterfire configure --platforms=android,web
-   firebase use --add
    ```
 
-   This regenerates `lib/firebase_options.dart` and `android/app/google-services.json`, and updates `.firebaserc`.
+   This regenerates `lib/firebase_options.dart`, `android/app/google-services.json`, and `.firebaserc`.
 
 ### 4. Deploy the security rules and index
 
@@ -161,8 +157,6 @@ flutter build web
 firebase deploy --only hosting
 ```
 
-The app is then live at `https://skill-swap-ebe85.web.app`.
-
 ## Build an Android APK (optional)
 
 ```bash
@@ -199,5 +193,3 @@ firebase.json            Firebase CLI config (Firestore + Hosting)
 - Bio, interests and profile pictures exist in the data model but are not yet shown or editable in the UI. Avatars use initials.
 - The Discover deck loads the 50 most recent users per refresh.
 - Swap Fit uses exact skill-name matching, so "Python" and "Python programming" do not count as a match.
-#   S k i l l - S w a p  
- 
